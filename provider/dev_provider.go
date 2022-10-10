@@ -2,12 +2,19 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/golang-jwt/jwt"
 
 	"golang.org/x/oauth2"
 
@@ -28,9 +35,11 @@ const (
 // desired user name, this is the mode used for development. Non-interactive mode for tests only.
 type DevAuthServer struct {
 	logger.L
-	Provider   Oauth2Handler
-	Automatic  bool
-	GetEmailFn func(string) string
+	Provider           Oauth2Handler
+	Automatic          bool
+	GetEmailFn         func(string) string
+	CustomizeIdTokenFn func(map[string]interface{}) map[string]interface{}
+
 	username   string // unsafe, but fine for dev
 	httpServer *http.Server
 	lock       sync.Mutex
@@ -56,6 +65,12 @@ func (d *DevAuthServer) Run(ctx context.Context) { // nolint (gocyclo)
 		return
 	}
 
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		d.Logf("[ERROR] failed to generate keys")
+		return
+	}
+
 	d.httpServer = &http.Server{
 		Addr: fmt.Sprintf(":%d", d.Provider.Port),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,24 +93,95 @@ func (d *DevAuthServer) Run(ctx context.Context) { // nolint (gocyclo)
 				}
 
 				state := r.URL.Query().Get("state")
-				callbackURL := fmt.Sprintf("%s?code=g0ZGZmNjVmOWI&state=%s", d.Provider.conf.RedirectURL, state)
+				redirectURI := r.URL.Query().Get("redirect_uri")
+				callbackURL := fmt.Sprintf("%s?code=g0ZGZmNjVmOWI&state=%s", redirectURI, state)
 				d.Logf("[DEBUG] callback url=%s", callbackURL)
 				w.Header().Add("Location", callbackURL)
 				w.WriteHeader(http.StatusFound)
 
 			case strings.HasPrefix(r.URL.Path, "/login/oauth/access_token"):
-				res := `{
+				email := d.username
+				if d.GetEmailFn != nil {
+					email = d.GetEmailFn(d.username)
+				}
+
+				idClaims := map[string]interface{}{
+					// required OpenID claims
+					"iss": "dev-auth",
+					"sub": "%s",
+					"aud": "client-id",
+					"iat": time.Now().Unix(),
+					"exp": time.Now().Add(1 * time.Hour).Unix(),
+
+					// optional OpenID claims
+					"picture":    fmt.Sprintf("http://127.0.0.1:%d/avatar?user=%s", d.Provider.Port, d.username),
+					"given_name": d.username,
+					"email":      email,
+				}
+
+				if d.CustomizeIdTokenFn != nil {
+					idClaims = d.CustomizeIdTokenFn(idClaims)
+				}
+
+				tk := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims(idClaims))
+				tk.Header["kid"] = "dev-auth-key-1"
+				signedTk, err := tk.SignedString(privateKey)
+				if err != nil {
+					d.Logf("[ERROR] failed to sign ID token")
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+
+				res := fmt.Sprintf(`{
 					"access_token":"MTQ0NjJkZmQ5OTM2NDE1ZTZjNGZmZjI3",
+					"id_token": "%s",
 					"token_type":"bearer",
 					"expires_in":3600,
 					"refresh_token":"IwOGYzYTlmM2YxOTQ5MGE3YmNmMDFkNTVk",
 					"scope":"create",
 					"state":"12345678"
-					}`
+					}`, signedTk)
+
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				if _, err = w.Write([]byte(res)); err != nil {
 					w.WriteHeader(http.StatusInternalServerError)
 					return
+				}
+
+			case strings.HasPrefix(r.URL.Path, "/jwks"):
+				type jwkKey struct {
+					Kty string `json:"kty"`
+					N   string `json:"n"`
+					E   string `json:"e"`
+					Alg string `json:"alg"`
+					Kid string `json:"kid"`
+				}
+
+				e := big.NewInt(int64(privateKey.E))
+				key := jwkKey{
+					Kty: "RSA",
+					Alg: "RS256",
+					Kid: "dev-auth-key-1",
+					N:   base64.RawURLEncoding.EncodeToString(privateKey.N.Bytes()),
+					E:   base64.RawURLEncoding.EncodeToString(e.Bytes()),
+				}
+
+				jwks, err := json.Marshal(struct {
+					Keys []jwkKey `json:"keys"`
+				}{
+					Keys: []jwkKey{key},
+				})
+				if err != nil {
+					d.Logf("[ERROR] failed to marshal jwks")
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+
+				w.WriteHeader(http.StatusOK)
+				wr, err := w.Write(jwks)
+				if err != nil || wr == 0 {
+					d.Logf("[ERROR] failed to write jwks")
+					w.WriteHeader(http.StatusInternalServerError)
 				}
 
 			case strings.HasPrefix(r.URL.Path, "/user"):
@@ -166,6 +252,10 @@ func (d *DevAuthServer) Shutdown() {
 	d.lock.Unlock()
 }
 
+func (d *DevAuthServer) ParseToken(value string) (claims token.Claims, err error) {
+	return d.Provider.JwtService.Parse(value)
+}
+
 // NewDev makes dev oauth2 provider for admin user
 func NewDev(p Params) Oauth2Handler {
 	if p.Port == 0 {
@@ -182,14 +272,23 @@ func NewDev(p Params) Oauth2Handler {
 		},
 		scopes:  []string{"user:email"},
 		infoURL: fmt.Sprintf("http://%s:%d/user", p.Host, p.Port),
+		jwksURL: fmt.Sprintf("http://%s:%d/jwks", p.Host, p.Port),
 		mapUser: func(data UserData, _ []byte) token.User {
-			userInfo := token.User{
+			if p.UseOpenID {
+				return token.User{
+					ID:      data.Value("sub"),
+					Name:    data.Value("given_name"),
+					Picture: data.Value("picture"),
+					Email:   data.Value("email"),
+				}
+			}
+
+			return token.User{
 				ID:      data.Value("id"),
 				Name:    data.Value("name"),
 				Picture: data.Value("picture"),
 				Email:   data.Value("email"),
 			}
-			return userInfo
 		},
 	})
 

@@ -218,9 +218,16 @@ func (s *Service) Middleware() middleware.Authenticator {
 	return s.authMiddleware
 }
 
+func (s *Service) AddOpenIDProvider(name, cid, csecret string) {
+	s.addProvider(name, cid, csecret, true)
+}
+
 // AddProvider adds provider for given name
 func (s *Service) AddProvider(name, cid, csecret string) {
+	s.addProvider(name, cid, csecret, false)
+}
 
+func (s *Service) addProvider(name, cid, csecret string, useOpenID bool) {
 	p := provider.Params{
 		URL:         s.opts.URL,
 		JwtService:  s.jwtService,
@@ -229,6 +236,7 @@ func (s *Service) AddProvider(name, cid, csecret string) {
 		Cid:         cid,
 		Csecret:     csecret,
 		L:           s.logger,
+		UseOpenID:   useOpenID,
 	}
 
 	switch strings.ToLower(name) {
@@ -267,6 +275,7 @@ func (s *Service) AddDevProvider(host string, port int) {
 		L:           s.logger,
 		Port:        port,
 		Host:        host,
+		UseOpenID:   true,
 	}
 	s.providers = append(s.providers, provider.NewService(provider.NewDev(p)))
 }
